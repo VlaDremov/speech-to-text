@@ -1,0 +1,5 @@
+torch>=2.0.0
+openai-whisper
+pyannote.audio
+pydub
+numpy
