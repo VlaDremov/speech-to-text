@@ -1,6 +1,8 @@
 from pyannote.audio import Pipeline
 import torch
 import logging
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 
 class SpeakerDiarization:
     def __init__(self, auth_token, device=None, num_speakers=2):
@@ -22,20 +24,42 @@ class SpeakerDiarization:
             )
             self.pipeline.to(torch.device(self.device))
             
+            # Speed optimization parameters
+            self.pipeline.instantiate({
+                "segmentation": {
+                    "min_duration_off": 0.1,      # Minimum duration of non-speech region
+                    "threshold": 0.50,            # Segmentation threshold (lower = faster)
+                },
+                "clustering": {
+                    "coef_dia": 1.0,             # Clustering coefficient
+                    "min_duration": 1.0,         # Minimum duration of speech turns
+                },
+            })
+            
         except Exception as e:
             logging.error(f"Failed to initialize diarization pipeline: {str(e)}")
             raise
 
-    def process(self, audio_path):
-        """Process audio file and return diarization results."""
+    def process_chunk(self, chunk_path):
+        """Process a single audio chunk"""
+        try:
+            return self.pipeline(chunk_path, num_speakers=self.num_speakers)
+        except Exception as e:
+            logging.error(f"Chunk processing failed: {str(e)}")
+            return None
+
+    def process(self, audio_path, chunk_duration=30):
+        """Process audio file with parallel chunk processing"""
         if not self.pipeline:
             raise RuntimeError("Pipeline not initialized")
             
         try:
-            # Apply diarization with specific number of speakers
+            logging.info("Starting parallel diarization processing...")
             diarization = self.pipeline(
                 audio_path,
-                num_speakers=self.num_speakers
+                num_speakers=self.num_speakers,
+                min_speakers=self.num_speakers,
+                max_speakers=self.num_speakers
             )
             
             results = []

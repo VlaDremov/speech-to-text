@@ -37,3 +37,11 @@ def split_audio_segments(audio, segment_length=30000):  # 30 seconds
         segment = audio[i:i+segment_length]
         segments.append(segment)
     return segments
+
+def split_long_audio(audio, max_duration=300):  # 5 minutes
+    """Split long audio files into smaller chunks"""
+    chunks = []
+    for i in range(0, len(audio), max_duration * 1000):
+        chunk = audio[i:i + max_duration * 1000]
+        chunks.append(chunk)
+    return chunks

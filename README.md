@@ -59,6 +59,15 @@ speech-to-text
    pip install -r requirements.txt
    ```
 
+## Setup
+
+1. Create a `.env` file in the project root:
+   ```plaintext
+   HUGGING_FACE_TOKEN=your_token_here
+   ```
+
+2. Replace `your_token_here` with your HuggingFace access token
+
 ## Usage
 
 1. Place your `.m4a` audio files in the `input` directory.

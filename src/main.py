@@ -6,6 +6,12 @@ from audio_processor import load_audio, normalize_audio, convert_to_mono
 from diarization import SpeakerDiarization
 from transcriber import WhisperTranscriber
 import torch
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 log_dir = "logs"
@@ -64,6 +70,10 @@ def process_audio(input_path, output_path, auth_token):
     logging.info("Loading audio file...")
     audio = load_audio(input_path)
     
+    # Add audio duration logging
+    duration_seconds = len(audio) / 1000  # pydub uses milliseconds
+    logging.info(f"Audio duration: {duration_seconds:.2f} seconds")
+    
     logging.info("Normalizing audio...")
     audio = normalize_audio(audio)
     
@@ -75,18 +85,29 @@ def process_audio(input_path, output_path, auth_token):
     logging.info(f"Exporting to temporary WAV file: {temp_wav}")
     audio.export(temp_wav, format="wav")
     
-    # Initialize models with GPU support
+    # Initialize models with GPU support and optimization parameters
     device = "cuda" if torch.cuda.is_available() else "cpu"
     diarizer = SpeakerDiarization(
         auth_token=auth_token, 
         device=device,
         num_speakers=2  # Explicitly set to 2 speakers
     )
-    transcriber = WhisperTranscriber(model_size="medium", device=device)
     
-    # Get diarization results
+    # Use medium model for better speed/accuracy trade-off
+    transcriber = WhisperTranscriber(
+        model_size="small", 
+        device=device
+    )
+    
+    # Get diarization results with progress logging
     logging.info("Starting speaker diarization...")
-    speakers = diarizer.process(temp_wav)
+    start_time = datetime.now()
+    speakers = diarizer.process(
+        temp_wav,
+        chunk_duration=30  # Process in 30-second chunks
+    )
+    diarization_time = (datetime.now() - start_time).total_seconds()
+    logging.info(f"Diarization completed in {diarization_time:.2f} seconds")
     logging.info(f"Found {len(speakers)} speaker segments")
     
     # Get transcription
@@ -143,7 +164,11 @@ if __name__ == "__main__":
     # Construct paths relative to project root
     INPUT_FILE = os.path.join(project_root, "input", "audio_test.m4a")
     OUTPUT_FILE = os.path.join(project_root, "output", "transcription_test.txt")# "transcription_granddad.txt")
-    AUTH_TOKEN = "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"
+    
+    # Get token from environment variable
+    AUTH_TOKEN = os.getenv('HUGGING_FACE_TOKEN')
+    if not AUTH_TOKEN:
+        raise ValueError("HUGGING_FACE_TOKEN not found in environment variables")
     
     # Verify file existence
     if not os.path.exists(INPUT_FILE):
