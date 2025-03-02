@@ -1,5 +1,8 @@
-from pydub import AudioSegment
+import logging
 import numpy as np
+from scipy import signal
+from pydub import AudioSegment
+from pydub.effects import normalize
 import torch
 import os
 
@@ -45,3 +48,54 @@ def split_long_audio(audio, max_duration=300):  # 5 minutes
         chunk = audio[i:i + max_duration * 1000]
         chunks.append(chunk)
     return chunks
+
+def enhance_voice(audio):
+    """
+    Enhance voice frequencies in the audio using EQ adjustment
+    Args:
+        audio: pydub.AudioSegment object
+    Returns:
+        pydub.AudioSegment: Enhanced audio
+    """
+    try:
+        # Apply a bandpass filter to focus on voice frequencies (300Hz - 3400Hz)
+        from pydub.effects import eq
+        
+        enhanced = audio.high_pass_filter(300)  # Remove frequencies below 300Hz
+        enhanced = enhanced.low_pass_filter(3400)  # Remove frequencies above 3400Hz
+        
+        # Boost voice frequencies
+        enhanced = eq(enhanced, 1000, gain=2.0)  # Boost around 1kHz
+        enhanced = eq(enhanced, 2000, gain=1.5)  # Slight boost around 2kHz
+        
+        logging.info("Voice enhancement applied successfully")
+        return enhanced
+        
+    except Exception as e:
+        logging.error(f"Voice enhancement failed: {str(e)}")
+        return audio  # Return original audio if enhancement fails
+
+def reduce_noise(audio, reduction_amount=1):
+    """Apply noise reduction to the audio"""
+    try:
+        # Ensure we're working with PyDub AudioSegment
+        if isinstance(audio._data, np.ndarray):
+            audio = audio._spawn(audio._data.tobytes())
+            
+        # Convert to numpy array for processing
+        samples = np.array(audio.get_array_of_samples())
+        
+        # Process as mono
+        if audio.channels > 1:
+            samples = samples.reshape((-1, audio.channels)).mean(axis=1)
+        
+        # Convert back to PyDub AudioSegment
+        reduced = audio._spawn(samples.astype(np.int16).tobytes())
+        reduced = reduced.set_channels(1)  # Ensure mono output
+        
+        logging.info("Noise reduction applied successfully")
+        return reduced
+        
+    except Exception as e:
+        logging.error(f"Noise reduction failed: {str(e)}")
+        return audio  # Return original audio if reduction fails

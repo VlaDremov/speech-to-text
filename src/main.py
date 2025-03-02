@@ -2,13 +2,15 @@ import os
 import logging
 import subprocess
 from datetime import datetime
-from audio_processor import load_audio, normalize_audio, convert_to_mono
+from audio_processor import load_audio, normalize_audio, convert_to_mono, enhance_voice, reduce_noise
 from diarization import SpeakerDiarization
 from transcriber import WhisperTranscriber
 import torch
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from dotenv import load_dotenv
+os.environ['PYTORCH_JIT'] = '0'
+os.environ['SPEECHBRAIN_SYMLINK_STRATEGY'] = 'copy'
 
 # Load environment variables
 load_dotenv()
@@ -70,32 +72,53 @@ def process_audio(input_path, output_path, auth_token):
     logging.info("Loading audio file...")
     audio = load_audio(input_path)
     
-    # Add audio duration logging
-    duration_seconds = len(audio) / 1000  # pydub uses milliseconds
+    # Validate audio duration and quality
+    duration_seconds = len(audio) / 1000
+    if duration_seconds < 0.5:  # If less than 0.5 seconds
+        raise ValueError("Audio file too short for processing")
+    
     logging.info(f"Audio duration: {duration_seconds:.2f} seconds")
+    logging.info(f"Sample rate: {audio.frame_rate}Hz")
+    logging.info(f"Channels: {audio.channels}")
     
-    logging.info("Normalizing audio...")
-    audio = normalize_audio(audio)
+    # Convert sample rate before other processing
+    if isinstance(audio._data, np.ndarray):
+        # Convert back to PyDub AudioSegment
+        audio = audio._spawn(audio._data.tobytes())
     
+    if audio.frame_rate != 16000:
+        logging.info(f"Converting sample rate from {audio.frame_rate}Hz to 16000Hz")
+        audio = audio.set_frame_rate(16000)
+    
+    # Ensure mono audio
     logging.info("Converting to mono...")
     audio = convert_to_mono(audio)
+    
+    # Apply audio enhancements after sample rate conversion
+    logging.info("Applying voice enhancement...")
+    audio = enhance_voice(audio)
+    
+    logging.info("Applying noise reduction...")
+    audio = reduce_noise(audio, reduction_amount=1)
     
     # Save preprocessed audio as WAV for compatibility
     temp_wav = "temp.wav"
     logging.info(f"Exporting to temporary WAV file: {temp_wav}")
-    audio.export(temp_wav, format="wav")
+    audio.export(temp_wav, format="wav", parameters=["-ac", "1", "-ar", "16000"])
     
     # Initialize models with GPU support and optimization parameters
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Initialize diarizer
     diarizer = SpeakerDiarization(
         auth_token=auth_token, 
         device=device,
-        num_speakers=2  # Explicitly set to 2 speakers
+        num_speakers=2
     )
     
-    # Use medium model for better speed/accuracy trade-off
+    # Initialize transcriber with large model for better Russian support
     transcriber = WhisperTranscriber(
-        model_size="small", 
+        model_size="medium",  # Use large-v3 for better Russian language support
         device=device
     )
     
@@ -104,47 +127,83 @@ def process_audio(input_path, output_path, auth_token):
     start_time = datetime.now()
     speakers = diarizer.process(
         temp_wav,
-        chunk_duration=30  # Process in 30-second chunks
+        chunk_duration=45,     # Increased for better speaker detection
+        step_duration=15       # Increased overlap for Russian speech patterns
     )
     diarization_time = (datetime.now() - start_time).total_seconds()
     logging.info(f"Diarization completed in {diarization_time:.2f} seconds")
     logging.info(f"Found {len(speakers)} speaker segments")
+    
+    # Merge short segments
+    speakers = merge_short_segments(speakers)
     
     # Get transcription
     logging.info("Starting transcription...")
     transcription = transcriber.transcribe(temp_wav)
     logging.info("Transcription completed")
     
-    # Combine results
-    logging.info(f"Writing output to: {output_path}")
+    # Combine results with improved speaker matching
     with open(output_path, 'w', encoding='utf-8') as f:
         current_speaker = None
         for segment in transcription:
-            # Find corresponding speaker for this segment
+            # Find speaker with maximum overlap
+            max_overlap = 0
             current_speaker_seg = None
-            for speaker_seg in speakers:
-                if (segment['start'] >= speaker_seg['start'] and 
-                    segment['start'] <= speaker_seg['end']):
-                    current_speaker_seg = speaker_seg
-                    break
             
-            # Write segment with speaker identification
-            if current_speaker_seg:
+            for speaker_seg in speakers:
+                # Calculate overlap duration
+                overlap_start = max(segment['start'], speaker_seg['start'])
+                overlap_end = min(segment['end'], speaker_seg['end'])
+                overlap = max(0, overlap_end - overlap_start)
+                
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    current_speaker_seg = speaker_seg
+            
+            # Only switch speakers if we have significant overlap
+            timestamp = f"[{format_timestamp(segment['start'])} -> {format_timestamp(segment['end'])}] "
+            if current_speaker_seg and max_overlap > 0.5:  # At least 0.5 seconds overlap
                 if current_speaker != current_speaker_seg['speaker']:
                     current_speaker = current_speaker_seg['speaker']
                     f.write(f"\n{current_speaker}:\n")
-                f.write(f"{segment['text'].strip()}\n")
+                f.write(f"{timestamp}{segment['text'].strip()}\n")
             else:
-                # Handle segments without clear speaker (optional)
-                if current_speaker != "UNKNOWN":
-                    current_speaker = "UNKNOWN"
-                    f.write("\nUNKNOWN:\n")
-                f.write(f"{segment['text'].strip()}\n")
-    
+                # Keep previous speaker if overlap is minimal
+                if current_speaker:
+                    f.write(f"{timestamp}{segment['text'].strip()}\n")
+                else:
+                    current_speaker = "НЕИЗВЕСТНЫЙ"  # "UNKNOWN" in Russian
+                    f.write(f"\n{current_speaker}:\n{timestamp}{segment['text'].strip()}\n")
+
     # Cleanup
     logging.info("Cleaning up temporary files...")
     os.remove(temp_wav)
     logging.info("Processing completed successfully")
+
+def merge_short_segments(segments, min_duration=2.0):
+    """Merge speaker segments shorter than min_duration with adjacent segments"""
+    if not segments:
+        return []
+        
+    merged = []
+    current = segments[0].copy()
+    
+    for next_seg in segments[1:]:
+        # If current segment is too short, merge with next
+        if (current['end'] - current['start']) < min_duration:
+            current['end'] = next_seg['end']
+            current['speaker'] = next_seg['speaker']
+        else:
+            merged.append(current)
+            current = next_seg.copy()
+    
+    # Don't forget to add the last segment
+    merged.append(current)
+    
+    return merged
+
+def format_timestamp(seconds):
+    return f"{int(seconds//60):02d}:{int(seconds%60):02d}"
 
 if __name__ == "__main__":
     if not verify_ffmpeg():
@@ -162,8 +221,8 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     
     # Construct paths relative to project root
-    INPUT_FILE = os.path.join(project_root, "input", "audio_test.m4a")
-    OUTPUT_FILE = os.path.join(project_root, "output", "transcription_test.txt")# "transcription_granddad.txt")
+    INPUT_FILE = os.path.join(project_root, "input", "audio_test1.m4a")
+    OUTPUT_FILE = os.path.join(project_root, "output",  "transcription_test1.txt")
     
     # Get token from environment variable
     AUTH_TOKEN = os.getenv('HUGGING_FACE_TOKEN')

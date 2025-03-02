@@ -24,18 +24,6 @@ class SpeakerDiarization:
             )
             self.pipeline.to(torch.device(self.device))
             
-            # Speed optimization parameters
-            self.pipeline.instantiate({
-                "segmentation": {
-                    "min_duration_off": 0.1,      # Minimum duration of non-speech region
-                    "threshold": 0.50,            # Segmentation threshold (lower = faster)
-                },
-                "clustering": {
-                    "coef_dia": 1.0,             # Clustering coefficient
-                    "min_duration": 1.0,         # Minimum duration of speech turns
-                },
-            })
-            
         except Exception as e:
             logging.error(f"Failed to initialize diarization pipeline: {str(e)}")
             raise
@@ -48,31 +36,36 @@ class SpeakerDiarization:
             logging.error(f"Chunk processing failed: {str(e)}")
             return None
 
-    def process(self, audio_path, chunk_duration=30):
-        """Process audio file with parallel chunk processing"""
+    def process(self, audio_path, chunk_duration=30, step_duration=None):
+        """Process audio file with speaker diarization"""
         if not self.pipeline:
             raise RuntimeError("Pipeline not initialized")
             
         try:
-            logging.info("Starting parallel diarization processing...")
+            logging.info("Starting speaker diarization...")
+            
+            # Add specific parameters for better speaker detection
             diarization = self.pipeline(
                 audio_path,
                 num_speakers=self.num_speakers,
-                min_speakers=self.num_speakers,
-                max_speakers=self.num_speakers
+                min_speakers=2,
+                max_speakers=2
             )
             
-            results = []
+            # Convert diarization result to list of segments
+            segments = []
             for turn, _, speaker in diarization.itertracks(yield_label=True):
-                results.append({
+                segments.append({
                     'start': turn.start,
                     'end': turn.end,
-                    'speaker': speaker
+                    'speaker': f"SPEAKER_{speaker}"
                 })
             
-            logging.info(f"Diarization completed with {self.num_speakers} speakers")
-            return results
+            if not segments:
+                logging.warning("No speaker segments detected. Check audio quality and parameters.")
+                
+            return segments
             
         except Exception as e:
             logging.error(f"Diarization failed: {str(e)}")
-            raise RuntimeError(f"Diarization failed: {str(e)}")
+            raise
