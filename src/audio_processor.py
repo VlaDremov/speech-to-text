@@ -1,80 +1,84 @@
 import logging
 import numpy as np
-from scipy import signal
-from pydub import AudioSegment
-from pydub.effects import normalize
-import os
-from io import BytesIO
+from scipy.signal import butter, lfilter
 import noisereduce as nr
+import os
+import audioread
 
 def load_audio(file_path):
-    """Load audio file with explicit FFmpeg path."""
+    """Load audio file using audioread."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Audio file not found: {file_path}")
     try:
-        audio = AudioSegment.from_file(
-            file_path,
-            format=file_path.split('.')[-1]
-        )
-        return audio
+        with audioread.audio_open(file_path) as f:
+            sr = f.samplerate
+            n_channels = f.channels
+            audio = np.hstack([np.frombuffer(buf, np.int16) for buf in f])
+            if n_channels > 1:
+                audio = audio.reshape(-1, n_channels).mean(axis=1)
+            return audio, sr
     except Exception as e:
         raise Exception(f"Error loading audio: {str(e)}")
 
-def normalize_audio(audio):
+def normalize_audio(audio, target_dbfs=-20.0):
     """Normalize audio levels."""
-    normalized_audio = audio.normalize(headroom=0.1)
+    rms = np.sqrt(np.mean(audio**2))
+    scalar = 10**(target_dbfs / 20) / rms
+    normalized_audio = audio * scalar
     return normalized_audio
 
 def convert_to_mono(audio):
     """Convert audio to mono channel."""
-    return audio.set_channels(1)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    return audio
 
-def get_audio_array(audio):
-    """Convert audio to a normalized numpy array (float32)."""
-    samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
-    return samples / 32768.0
+def butter_bandpass(lowcut, highcut, fs, order=5):
+    """Create a bandpass filter."""
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
 
-def split_audio_segments(audio, segment_length=30000):  # 30 seconds
-    """Split audio into segments."""
-    segments = []
-    for i in range(0, len(audio), segment_length):
-        segment = audio[i:i+segment_length]
-        segments.append(segment)
-    return segments
+def bandpass_filter(audio, lowcut, highcut, fs, order=5):
+    """Apply a bandpass filter to the audio."""
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = lfilter(b, a, audio)
+    return y
 
-def split_long_audio(audio, max_duration=300):  # 5 minutes
-    """Split long audio files into smaller chunks."""
-    chunks = []
-    for i in range(0, len(audio), max_duration * 1000):
-        chunk = audio[i:i + max_duration * 1000]
-        chunks.append(chunk)
-    return chunks
-
-def enhance_voice(audio):
+def enhance_voice(audio, sr):
     """
     Enhance voice frequencies using EQ adjustment.
     """
     try:
-        from pydub.effects import eq
-        enhanced = audio.high_pass_filter(300)   # Remove frequencies below 300Hz
-        enhanced = enhanced.low_pass_filter(3400)  # Remove frequencies above 3400Hz
-        # Boost voice frequencies
-        enhanced = eq(enhanced, 1000, gain=2.0)  # Boost around 1kHz
-        enhanced = eq(enhanced, 2000, gain=1.5)  # Slight boost around 2kHz
+        enhanced = bandpass_filter(audio, 300, 3400, sr)  # Bandpass filter for voice frequencies
         logging.info("Voice enhancement applied successfully")
         return enhanced
     except Exception as e:
         logging.error(f"Voice enhancement failed: {str(e)}")
         return audio
 
-def reduce_noise(audio, reduction_amount=1):
-    """Apply noise reduction using the noisereduce library."""
+def reduce_noise(audio, sr, reduction_amount=10):
+    """
+    Apply noise reduction to the audio.
+    """
     try:
-        samples = get_audio_array(audio)  # Normalized float array
-        sr = audio.frame_rate
-        reduced = nr.reduce_noise(y=samples, sr=sr)
-        reduced_int16 = (reduced * 32768).astype(np.int16)
-        return audio._spawn(reduced_int16.tobytes())
+        reduced_noise = nr.reduce_noise(y=audio, sr=sr, prop_decrease=reduction_amount/100)
+        logging.info("Noise reduction applied successfully")
+        return reduced_noise
     except Exception as e:
         logging.error(f"Noise reduction failed: {str(e)}")
         return audio
+
+def split_audio_segments(audio, sr, segment_length=30):  # 30 seconds
+    """Split audio into segments."""
+    segment_samples = segment_length * sr
+    segments = [audio[i:i + segment_samples] for i in range(0, len(audio), segment_samples)]
+    return segments
+
+def split_long_audio(audio, sr, max_duration=300):  # 5 minutes
+    """Split long audio files into smaller chunks."""
+    chunk_samples = max_duration * sr
+    chunks = [audio[i + chunk_samples] for i in range(0, len(audio), chunk_samples)]
+    return chunks

@@ -1,5 +1,9 @@
-torch>=2.0.0
-openai-whisper
 pyannote.audio
-pydub
+librosa
+noisereduce
+soundfile
+scikit-learn
 numpy
+scipy
+audioread
+python-dotenv

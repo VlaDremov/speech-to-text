@@ -7,6 +7,10 @@ from diarization import SpeakerDiarization
 from transcriber import WhisperTranscriber
 import torch
 from dotenv import load_dotenv
+import librosa
+import numpy as np
+from scipy.io import wavfile
+
 os.environ['PYTORCH_JIT'] = '0'
 os.environ['SPEECHBRAIN_SYMLINK_STRATEGY'] = 'copy'
 
@@ -77,30 +81,33 @@ def process_audio(input_path, output_path, auth_token):
     logging.info(f"Starting audio processing for file: {input_path}")
     
     # Load and preprocess audio
-    audio = load_audio(input_path)
-    duration_seconds = len(audio) / 1000
+    audio, sr = load_audio(input_path)
+    logging.info(f"Audio loaded: {len(audio)} samples")
+    duration_seconds = len(audio) / sr
     if duration_seconds < 0.5:
         raise ValueError("Audio file too short for processing")
     logging.info(f"Audio duration: {duration_seconds:.2f} seconds")
-    logging.info(f"Sample rate: {audio.frame_rate}Hz, Channels: {audio.channels}")
+    logging.info(f"Sample rate: {sr}Hz")
     
     # Convert sample rate if necessary
-    # if audio.frame_rate != 16000:
-    #     logging.info(f"Converting sample rate from {audio.frame_rate}Hz to 16000Hz")
-    #     audio = audio.set_frame_rate(16000)
+    if sr != 16000:
+        logging.info(f"Converting sample rate from {sr}Hz to 16000Hz")
+        audio = audio.astype(np.float32) / np.max(np.abs(audio))  # Convert to floating-point
+        audio = librosa.resample(y=audio, orig_sr=sr, target_sr=16000)
+        sr = 16000
     
-    # logging.info("Converting to mono...")
-    # audio = convert_to_mono(audio)
+    # Convert to mono if necessary
+    audio = convert_to_mono(audio)
     
-    logging.info("Applying voice enhancement...")
-    audio = enhance_voice(audio)
+    # logging.info("Applying voice enhancement...")
+    # audio = enhance_voice(audio, sr)
     
     # logging.info("Applying noise reduction...")
-    # audio = reduce_noise(audio, reduction_amount=1)
+    # audio = reduce_noise(audio, sr, reduction_amount=10)
     
     temp_wav = "temp.wav"
     logging.info(f"Exporting to temporary WAV file: {temp_wav}")
-    audio.export(temp_wav, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+    wavfile.write(temp_wav, sr, (audio * 32767).astype(np.int16))  # Convert back to int16 for saving
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
@@ -124,7 +131,7 @@ def process_audio(input_path, output_path, auth_token):
         temp_wav,
         preprocess=False,
         clustering_post=True,
-        chunk_duration=30,
+        chunk_duration=60,
         overlap_duration=5
     )
     diarization_time = (datetime.now() - start_time).total_seconds()
@@ -175,8 +182,8 @@ if __name__ == "__main__":
     output_dir = os.path.join(project_root, "output")
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    INPUT_FILE = os.path.join(project_root, "input", "audio_test1.m4a")
-    OUTPUT_FILE = os.path.join(project_root, "output", "transcriptio_granddad2.txt")
+    INPUT_FILE = os.path.join(project_root, "input", "audio.m4a")
+    OUTPUT_FILE = os.path.join(project_root, "output", "transc_granddad.txt")
     AUTH_TOKEN = os.getenv('HUGGING_FACE_TOKEN')
     if not AUTH_TOKEN:
         raise ValueError("HUGGING_FACE_TOKEN not found in environment variables")
