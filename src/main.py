@@ -127,7 +127,7 @@ def process_audio(input_path, output_path, auth_token):
     logging.info("Initializing simple speaker diarization...")
     diarizer = SimpleDiarization(auth_token=auth_token, num_speakers=2, device=device)
 
-    transcriber = WhisperTranscriber(model_size="medium", device=device)
+    transcriber = WhisperTranscriber(model_size="large-v3", device=device)
 
     logging.info("Starting simple speaker diarization...")
     start_time = datetime.now()
@@ -138,7 +138,7 @@ def process_audio(input_path, output_path, auth_token):
     )
 
     # speakers = merge_short_segments(speakers)
-
+    logging.info(f"Found {len(speakers)} speaker segments after merging")
     logging.info("Starting transcription...")
     start_time = datetime.now()
     transcription = transcriber.transcribe(temp_wav)
@@ -193,10 +193,10 @@ if __name__ == "__main__":
     output_dir = os.path.join(project_root, "output")
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    INPUT_FILE = "/content/drive/MyDrive/audio_wav.wav"  # os.path.join(project_root, "input", "audio.m4a")
-    OUTPUT_FILE = "/content/drive/MyDrive/transcr1603.txt"
-    # INPUT_FILE = os.path.join(project_root, "input", "audio.m4a")
-    # OUTPUT_FILE = os.path.join(project_root, "output", "transc_1303_.txt")
+    # INPUT_FILE = "/content/drive/MyDrive/audio_wav.wav"  # os.path.join(project_root, "input", "audio.m4a")
+    # OUTPUT_FILE = "/content/drive/MyDrive/transcr1603.txt"
+    INPUT_FILE = os.path.join(project_root, "input", "audio.m4a")
+    OUTPUT_FILE = os.path.join(project_root, "output", "transc_1303_.txt")
     AUTH_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
     if not AUTH_TOKEN:
         raise ValueError("HUGGING_FACE_TOKEN not found in environment variables")

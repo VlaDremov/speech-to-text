@@ -3,6 +3,7 @@ import torch
 import logging
 import time
 from typing import List, Dict
+from pyannote.audio.pipelines.utils.hook import ProgressHook
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,7 +28,8 @@ class SimpleDiarization:
         start_time = time.time()
         try:
             with torch.no_grad():
-                diarization = self.pipeline(audio_path, num_speakers=self.num_speakers)
+                with ProgressHook() as hook:
+                    diarization = self.pipeline(audio_path, num_speakers=self.num_speakers, hook=hook)
         except Exception as e:
             logging.error(f"Error processing {audio_path}: {e}")
             raise
@@ -37,6 +39,5 @@ class SimpleDiarization:
             for turn, _, speaker in diarization.itertracks(yield_label=True)
         ]
         logging.info(f"Found {len(segments)} segments before merging.")
-        merged_segments = segments
         logging.info(f"Processing completed in {time.time() - start_time:.2f} seconds.")
-        return merged_segments
+        return segments
