@@ -89,7 +89,7 @@ def format_timestamp(seconds):
     return f"{int(seconds//60):02d}:{int(seconds%60):02d}"
 
 
-def process_audio(input_path, output_path, auth_token):
+def process_audio(input_path, output_path, auth_token, model_size="medium"):
     logging.info(f"Starting audio processing for file: {input_path}")
 
     # Load and preprocess audio
@@ -127,7 +127,7 @@ def process_audio(input_path, output_path, auth_token):
     logging.info("Initializing simple speaker diarization...")
     diarizer = SimpleDiarization(auth_token=auth_token, num_speakers=2, device=device)
 
-    transcriber = WhisperTranscriber(model_size="large-v3", device=device)
+    transcriber = WhisperTranscriber(model_size=model_size, device=device)
 
     logging.info("Starting simple speaker diarization...")
     start_time = datetime.now()
@@ -195,8 +195,8 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     # INPUT_FILE = "/content/drive/MyDrive/audio_wav.wav"  # os.path.join(project_root, "input", "audio.m4a")
     # OUTPUT_FILE = "/content/drive/MyDrive/transcr1603.txt"
-    INPUT_FILE = os.path.join(project_root, "input", "audio.m4a")
-    OUTPUT_FILE = os.path.join(project_root, "output", "transc_1303_.txt")
+    INPUT_FILE = os.path.join(project_root, "input", "grandad_sample.m4a")
+    OUTPUT_FILE = os.path.join(project_root, "output", "transc_granddad1503.txt")
     AUTH_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
     if not AUTH_TOKEN:
         raise ValueError("HUGGING_FACE_TOKEN not found in environment variables")
@@ -208,7 +208,7 @@ if __name__ == "__main__":
     else:
         logging.warning("No GPU detected, using CPU only")
     try:
-        process_audio(INPUT_FILE, OUTPUT_FILE, AUTH_TOKEN)
+        process_audio(INPUT_FILE, OUTPUT_FILE, AUTH_TOKEN, model_size="medium")
     except Exception as e:
         logging.error(f"Error during processing: {str(e)}")
         raise
