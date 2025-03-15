@@ -24,8 +24,8 @@ class WhisperTranscriber:
                 initial_prompt="Это разговор на русском языке.",
                 word_timestamps=True,
                 condition_on_previous_text=False,
-                temperature=0.3,
-                no_speech_threshold=0.1,
+                temperature=0.2,
+                no_speech_threshold=0.01,
                 # compression_ratio_threshold=2.4,
                 # logprob_threshold=-1.0
             )

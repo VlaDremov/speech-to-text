@@ -4,10 +4,8 @@ import subprocess
 from datetime import datetime
 from audio_processor import (
     load_audio,
-    # normalize_audio,
+    normalize_audio,
     convert_to_mono,
-    # enhance_voice,
-    # reduce_noise,
 )
 from diarization import SimpleDiarization
 from transcriber import WhisperTranscriber
@@ -139,7 +137,7 @@ def process_audio(input_path, output_path, auth_token):
         f"Simple diarization completed in {diarization_time:.2f} seconds with {len(speakers)} segments"
     )
 
-    speakers = merge_short_segments(speakers)
+    # speakers = merge_short_segments(speakers)
 
     logging.info("Starting transcription...")
     start_time = datetime.now()
@@ -149,24 +147,26 @@ def process_audio(input_path, output_path, auth_token):
         f"Transcription completed in {transcription_time:.2f} seconds with {len(transcription)} segments"
     )
 
-    with open(output_path, 'w', encoding='utf-8') as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         current_speaker = None
         for segment in transcription:
             max_overlap_ratio = 0
             current_speaker_seg = None
-            seg_duration = segment['end'] - segment['start']
+            seg_duration = segment["end"] - segment["start"]
             for speaker_seg in speakers:
-                overlap_start = max(segment['start'], speaker_seg['start'])
-                overlap_end = min(segment['end'], speaker_seg['end'])
+                overlap_start = max(segment["start"], speaker_seg["start"])
+                overlap_end = min(segment["end"], speaker_seg["end"])
                 overlap = max(0, overlap_end - overlap_start)
                 overlap_ratio = overlap / seg_duration if seg_duration > 0 else 0
                 if overlap_ratio > max_overlap_ratio:
                     max_overlap_ratio = overlap_ratio
                     current_speaker_seg = speaker_seg
             timestamp = f"[{format_timestamp(segment['start'])} -> {format_timestamp(segment['end'])}] "
-            if current_speaker_seg and max_overlap_ratio > 0.1:  # Threshold can be tuned
-                if current_speaker != current_speaker_seg['speaker']:
-                    current_speaker = current_speaker_seg['speaker']
+            if (
+                current_speaker_seg and max_overlap_ratio > 0.1
+            ):  # Threshold can be tuned
+                if current_speaker != current_speaker_seg["speaker"]:
+                    current_speaker = current_speaker_seg["speaker"]
                     f.write(f"\n{current_speaker}:\n")
                 f.write(f"{timestamp}{segment['text'].strip()}\n")
             else:
@@ -174,8 +174,9 @@ def process_audio(input_path, output_path, auth_token):
                     f.write(f"{timestamp}{segment['text'].strip()}\n")
                 else:
                     current_speaker = "НЕИЗВЕСТНЫЙ"
-                    f.write(f"\n{current_speaker}:\n{timestamp}{segment['text'].strip()}\n")
-
+                    f.write(
+                        f"\n{current_speaker}:\n{timestamp}{segment['text'].strip()}\n"
+                    )
 
     logging.info("Cleaning up temporary files...")
     if os.path.exists(temp_wav):
@@ -192,8 +193,10 @@ if __name__ == "__main__":
     output_dir = os.path.join(project_root, "output")
     os.makedirs(input_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
-    INPUT_FILE = os.path.join(project_root, "input", "audio.m4a")
-    OUTPUT_FILE = os.path.join(project_root, "output", "transc_1303_.txt")
+    INPUT_FILE = "/content/drive/MyDrive/audio_wav.wav"  # os.path.join(project_root, "input", "audio.m4a")
+    OUTPUT_FILE = "/content/drive/MyDrive/transcr1603.txt"
+    # INPUT_FILE = os.path.join(project_root, "input", "audio.m4a")
+    # OUTPUT_FILE = os.path.join(project_root, "output", "transc_1303_.txt")
     AUTH_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
     if not AUTH_TOKEN:
         raise ValueError("HUGGING_FACE_TOKEN not found in environment variables")

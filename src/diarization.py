@@ -22,24 +22,6 @@ class SimpleDiarization:
         self.pipeline.to(torch.device(device))
         self.num_speakers = num_speakers
 
-    def merge_segments(
-        self, segments: List[Dict], tolerance: float = 0.2
-    ) -> List[Dict]:
-        """Merge consecutive segments for the same speaker if gaps are within tolerance."""
-        if not segments:
-            return segments
-        merged = [segments[0]]
-        for seg in segments[1:]:
-            last = merged[-1]
-            if (
-                seg["speaker"] == last["speaker"]
-                and seg["start"] - last["end"] <= tolerance
-            ):
-                last["end"] = seg["end"]
-            else:
-                merged.append(seg)
-        return merged
-
     def process(self, audio_path: str) -> List[Dict]:
         logging.info(f"Processing audio file: {audio_path}")
         start_time = time.time()
@@ -55,9 +37,6 @@ class SimpleDiarization:
             for turn, _, speaker in diarization.itertracks(yield_label=True)
         ]
         logging.info(f"Found {len(segments)} segments before merging.")
-        merged_segments = self.merge_segments(segments)
-        logging.info(
-            f"{len(merged_segments)} segments after merging contiguous segments."
-        )
+        merged_segments = segments
         logging.info(f"Processing completed in {time.time() - start_time:.2f} seconds.")
         return merged_segments
