@@ -11,6 +11,7 @@ from audio_processor import (
     detect_environment,
     apply_preemphasis,
     bandpass_filter,
+    # split_audio_segments,
 )
 from diarization import SimpleDiarization
 from transcriber import WhisperTranscriber
@@ -20,6 +21,7 @@ import librosa
 import numpy as np
 import soundfile as sf
 import os.path
+from collections import defaultdict
 
 # Fix for Windows symbolic link issues with SpeechBrain
 os.environ["PYTORCH_JIT"] = "0"
@@ -206,11 +208,15 @@ def main():
         output_filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         output_file = os.path.join(output_dir, output_filename)
         model_size = "medium"
-    else:
-        input_file = "/content/drive/MyDrive/audio_wav.wav"
+    elif mode == "colab":
+        # Google Colab paths
+        input_file = (
+            "/content/drive/MyDrive/your_audio_file.m4a"  # Your audio file on Drive
+        )
+        output_dir = "/content/drive/MyDrive/"
         output_filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         output_file = os.path.join(output_dir, output_filename)
-        model_size = "large-v3"
+        model_size = "large-v3"  # Or "large-v3" if you have enough resources
 
     # Authentication
     auth_token = os.getenv("HUGGING_FACE_TOKEN")
@@ -229,11 +235,19 @@ def main():
     default_min_speaker_duration = 0.5
     phone_min_speaker_duration = 0.3
 
+    # Audio chunking parameters
+    enable_chunking = True  # Set to False to disable chunking completely
+    chunk_size_seconds = 60  # 5 minutes per chunk
+    chunk_overlap_seconds = 20  # 30 seconds of overlap between chunks
+    max_duration_for_single_chunk = (
+        120  # 10 minutes - files longer than this will be chunked
+    )
+
     # Segment merging parameters
-    default_merge_duration = 0.8
-    default_merge_gap = 0.5
-    phone_merge_duration = 0.4
-    phone_merge_gap = 0.3
+    default_merge_duration = 0.2
+    default_merge_gap = 0.2
+    phone_merge_duration = 0.2
+    phone_merge_gap = 0.2
 
     # Speaker confidence thresholds
     confidence_threshold_default = 0.15
@@ -272,13 +286,9 @@ def main():
         # STEP 3: Apply noise reduction based on environment
         if env_type == "noisy":
             logging.info("Applying enhanced noise reduction for noisy environment")
-            audio = reduce_noise(
-                audio, sr, reduction_amount=reduction_amount
-            )
+            audio = reduce_noise(audio, sr, reduction_amount=reduction_amount)
         else:
-            audio = reduce_noise(
-                audio, sr, reduction_amount=reduction_amount_noisy
-            )
+            audio = reduce_noise(audio, sr, reduction_amount=reduction_amount_noisy)
 
         # STEP 4: Apply pre-emphasis for speech enhancement
         audio = apply_preemphasis(audio, coef=preemphasis_coefficient)
@@ -339,14 +349,130 @@ def main():
 
         transcriber = WhisperTranscriber(model_size=model_size, device=device)
 
-        # STEP 11: Perform diarization
-        logging.info("Starting simple speaker diarization...")
-        start_time = datetime.now()
-        speakers = diarizer.process(temp_wav)
-        diarization_time = (datetime.now() - start_time).total_seconds()
-        logging.info(
-            f"Simple diarization completed in {diarization_time:.2f} seconds with {len(speakers)} segments"
-        )
+        # STEP 11: Perform diarization (with chunking for long files)
+        # Check if we should apply chunking
+        if enable_chunking and duration_seconds > max_duration_for_single_chunk:
+            logging.info(
+                f"Audio file is {duration_seconds:.2f} seconds long, applying chunking"
+            )
+
+            # STEP 11.1: Split audio into overlapping chunks
+            chunk_size_samples = int(chunk_size_seconds * sr)
+            chunk_overlap_samples = int(chunk_overlap_seconds * sr)
+
+            # Create a list to store chunk files and results
+            chunk_files = []
+            all_speakers = []
+
+            # Calculate number of chunks
+            num_chunks = int(
+                np.ceil(len(audio) / (chunk_size_samples - chunk_overlap_samples))
+            )
+            logging.info(
+                f"Splitting audio into {num_chunks} chunks with {chunk_overlap_seconds}s overlap"
+            )
+
+            # Process each chunk
+            for i in range(num_chunks):
+                start_sample = max(0, i * (chunk_size_samples - chunk_overlap_samples))
+                end_sample = min(len(audio), start_sample + chunk_size_samples)
+
+                chunk_audio = audio[start_sample:end_sample]
+                chunk_filename = f"{base}_chunk_{i+1}.wav"
+                chunk_path = os.path.join(temp_dir, chunk_filename)
+                chunk_files.append(chunk_path)
+
+                # Save chunk to file
+                sf.write(chunk_path, chunk_audio, sr)
+                logging.info(f"Saved chunk {i+1}/{num_chunks} to {chunk_path}")
+
+                # Process this chunk
+                logging.info(f"Processing chunk {i+1}/{num_chunks}")
+                chunk_speakers = diarizer.process(chunk_path)
+
+                # Adjust timestamps to account for the chunk position in the original audio
+                start_time = start_sample / sr
+                for segment in chunk_speakers:
+                    segment["start"] += start_time
+                    segment["end"] += start_time
+                    # Add chunk info for debugging/analysis
+                    segment["chunk"] = i + 1
+
+                all_speakers.extend(chunk_speakers)
+                logging.info(
+                    f"Chunk {i+1} produced {len(chunk_speakers)} speaker segments"
+                )
+
+            # STEP 11.2: Harmonize speaker labels across chunks
+            # Build a mapping of speaker embeddings to find consistent labels
+            speaker_clusters = defaultdict(list)
+
+            # First, group segments by original speaker
+            for segment in all_speakers:
+                original_speaker = segment["speaker"]
+                speaker_clusters[original_speaker].append(segment)
+
+            # Look for overlapping speakers between chunks
+            speaker_mapping = {}
+            speaker_count = 0
+
+            # A simple approach - merge speakers with similar time ranges
+            for speaker, segments in speaker_clusters.items():
+                assigned = False
+                for global_speaker, global_id in speaker_mapping.items():
+                    # Check if any segment from this speaker overlaps with the global speaker's segments
+                    for segment in segments:
+                        for global_segment in speaker_clusters[global_speaker]:
+                            # If there's significant overlap between speakers in different chunks
+                            if (
+                                segment["chunk"] != global_segment["chunk"]
+                                and segment["start"] < global_segment["end"]
+                                and segment["end"] > global_segment["start"]
+                            ):
+                                # Merge these speakers
+                                speaker_mapping[speaker] = global_id
+                                assigned = True
+                                break
+                        if assigned:
+                            break
+                    if assigned:
+                        break
+
+                # If no match found, create a new global speaker ID
+                if not assigned:
+                    speaker_count += 1
+                    speaker_mapping[speaker] = f"SPEAKER_{speaker_count}"
+
+            # Create final harmonized list of speaker segments
+            speakers = []
+            for segment in all_speakers:
+                fixed_segment = segment.copy()
+                original_speaker = segment["speaker"]
+                fixed_segment["speaker"] = speaker_mapping.get(
+                    original_speaker, original_speaker
+                )
+                speakers.append(fixed_segment)
+
+            # Sort segments by start time
+            speakers.sort(key=lambda x: x["start"])
+
+            # Clean up chunk files
+            for chunk_file in chunk_files:
+                if os.path.exists(chunk_file):
+                    os.remove(chunk_file)
+
+            logging.info(
+                f"Completed chunked processing with {len(speakers)} total segments"
+            )
+        else:
+            # Process the entire file as one chunk
+            logging.info("Processing entire audio file as a single unit")
+            start_time = datetime.now()
+            speakers = diarizer.process(temp_wav)
+            diarization_time = (datetime.now() - start_time).total_seconds()
+            logging.info(
+                f"Diarization completed in {diarization_time:.2f} seconds with {len(speakers)} segments"
+            )
 
         # STEP 12: Set segment merging parameters based on audio type
         merge_duration = default_merge_duration
