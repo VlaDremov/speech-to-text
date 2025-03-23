@@ -147,7 +147,8 @@ def calculate_speaker_confidence(segment, speaker_segments):
     if max_overlap_ratio < 0.3:
         # Look for nearby segments from the same speaker
         speaker_counts = {}
-        window = 2.0  # Look at speakers +/- 2 seconds
+        speaker_durations = {}
+        window = 3.0  # Look at speakers +/- 3 seconds (increased from 2.0)
 
         for speaker_seg in speaker_segments:
             # Check if segment is nearby
@@ -157,18 +158,35 @@ def calculate_speaker_confidence(segment, speaker_segments):
             ):
                 speaker = speaker_seg["speaker"]
                 speaker_counts[speaker] = speaker_counts.get(speaker, 0) + 1
+                
+                # Also consider duration of nearby segments
+                speaker_dur = speaker_seg["end"] - speaker_seg["start"]
+                speaker_durations[speaker] = speaker_durations.get(speaker, 0) + speaker_dur
 
         # If we have nearby segments, boost confidence
         if speaker_counts:
-            most_common_speaker = max(speaker_counts.items(), key=lambda x: x[1])[0]
+            # Find speaker with most segments and longest duration
+            speakers_by_count = sorted(speaker_counts.items(), key=lambda x: x[1], reverse=True)
+            speakers_by_duration = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)
+            
+            # Combine both metrics
+            combined_score = {}
+            for speaker, count in speakers_by_count:
+                combined_score[speaker] = count / max(speaker_counts.values())
+                
+            for speaker, duration in speakers_by_duration:
+                combined_score[speaker] = combined_score.get(speaker, 0) + duration / max(speaker_durations.values())
+            
+            most_likely_speaker = max(combined_score.items(), key=lambda x: x[1])[0]
+            
             # If we already found an overlapping speaker, give it priority
             if best_speaker and best_speaker in speaker_counts:
                 # Adjust overlap ratio based on speaker context
-                max_overlap_ratio = max(max_overlap_ratio, 0.3)
-            # Otherwise use the most common nearby speaker
+                max_overlap_ratio = max(max_overlap_ratio, 0.4)  # Increased from 0.3
+            # Otherwise use the most likely nearby speaker
             elif max_overlap_ratio < 0.2:
-                best_speaker = most_common_speaker
-                max_overlap_ratio = 0.2
+                best_speaker = most_likely_speaker
+                max_overlap_ratio = 0.3  # Increased from 0.2
 
     return best_speaker, max_overlap_ratio
 
@@ -204,7 +222,7 @@ def main():
     # Input/output file configuration
     mode = "local"
     if mode == "local":
-        input_file = os.path.join(input_dir, "audio_mom_1_sample.m4a")
+        input_file = os.path.join(input_dir, "audio_mom_240s.m4a")
         output_filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         output_file = os.path.join(output_dir, output_filename)
         model_size = "medium"
@@ -231,17 +249,21 @@ def main():
     target_sample_rate = 16000
 
     # Diarization parameters
-    default_num_speakers = 2
-    default_min_speaker_duration = 0.5
-    phone_min_speaker_duration = 0.3
+    default_num_speakers = 2  # Let model auto-determine speaker count
+    default_min_speaker_duration = 0.3  # Reduced from 0.5
+    phone_min_speaker_duration = 0.2  # Reduced from 0.3
+    # Clustering threshold: controls how aggressively speakers are separated
+    # Valid values are between 0.0 and 1.0
+    # - Lower values (0.3-0.4): More aggressive separation, more speakers detected
+    # - Higher values (0.6-0.7): More conservative, may merge similar voices
+    # Note: For PyAnnote, threshold is used with "average" linkage method
+    default_clustering_threshold = 0.45  # Balanced value for most recordings
 
     # Audio chunking parameters
     enable_chunking = True  # Set to False to disable chunking completely
-    chunk_size_seconds = 60  # 5 minutes per chunk
-    chunk_overlap_seconds = 20  # 30 seconds of overlap between chunks
-    max_duration_for_single_chunk = (
-        120  # 10 minutes - files longer than this will be chunked
-    )
+    chunk_size_seconds = 30  # Reduced from 60 for better segmentation
+    chunk_overlap_seconds = 10  # Adjusted from 20
+    max_duration_for_single_chunk = 90  # Reduced from 120
 
     # Segment merging parameters
     default_merge_duration = 0.2
@@ -250,9 +272,9 @@ def main():
     phone_merge_gap = 0.2
 
     # Speaker confidence thresholds
-    confidence_threshold_default = 0.15
-    confidence_threshold_noisy = 0.12
-    confidence_threshold_clean = 0.18
+    confidence_threshold_default = 0.1
+    confidence_threshold_noisy = 0.08
+    confidence_threshold_clean = 0.12
 
     # =====================================
     # MAIN PROCESSING
@@ -345,6 +367,7 @@ def main():
             num_speakers=num_speakers,
             device=device,
             min_speaker_duration=min_speaker_duration,
+            clustering_threshold=default_clustering_threshold,
         )
 
         transcriber = WhisperTranscriber(model_size=model_size, device=device)
@@ -412,37 +435,55 @@ def main():
                 original_speaker = segment["speaker"]
                 speaker_clusters[original_speaker].append(segment)
 
-            # Look for overlapping speakers between chunks
+            # Improved speaker mapping algorithm
             speaker_mapping = {}
-            speaker_count = 0
-
-            # A simple approach - merge speakers with similar time ranges
-            for speaker, segments in speaker_clusters.items():
-                assigned = False
-                for global_speaker, global_id in speaker_mapping.items():
-                    # Check if any segment from this speaker overlaps with the global speaker's segments
+            global_speakers = []
+            
+            # Sort clusters by total duration (longer clusters first)
+            sorted_clusters = sorted(
+                speaker_clusters.items(),
+                key=lambda x: sum(seg["end"] - seg["start"] for seg in x[1]),
+                reverse=True
+            )
+            
+            for speaker, segments in sorted_clusters:
+                best_match = None
+                best_score = 0.15  # Minimum threshold to consider a match
+                
+                # Compare with existing global speakers
+                for global_speaker in global_speakers:
+                    g_segments = speaker_clusters[global_speaker]
+                    
+                    # Skip if speakers are from same chunks (they can't be the same person)
+                    if any(seg["chunk"] == g_seg["chunk"] for seg in segments for g_seg in g_segments):
+                        continue
+                    
+                    # Check segment overlaps with looser criteria
+                    segment_overlaps = 0
                     for segment in segments:
-                        for global_segment in speaker_clusters[global_speaker]:
-                            # If there's significant overlap between speakers in different chunks
-                            if (
-                                segment["chunk"] != global_segment["chunk"]
-                                and segment["start"] < global_segment["end"]
-                                and segment["end"] > global_segment["start"]
-                            ):
-                                # Merge these speakers
-                                speaker_mapping[speaker] = global_id
-                                assigned = True
+                        for g_segment in g_segments:
+                            # Consider nearby segments too
+                            nearby_threshold = 1.0  # Consider segments within 1s
+                            overlap_condition = (segment["start"] - nearby_threshold <= g_segment["end"]) and (segment["end"] + nearby_threshold >= g_segment["start"])
+                            if overlap_condition:
+                                segment_overlaps += 1
                                 break
-                        if assigned:
-                            break
-                    if assigned:
-                        break
-
-                # If no match found, create a new global speaker ID
-                if not assigned:
-                    speaker_count += 1
-                    speaker_mapping[speaker] = f"SPEAKER_{speaker_count}"
-
+                    
+                    overlap_score = segment_overlaps / len(segments)
+                    
+                    if overlap_score > best_score:
+                        best_score = overlap_score
+                        best_match = global_speaker
+                
+                if best_match:
+                    # Map to existing global speaker
+                    speaker_mapping[speaker] = speaker_mapping.get(best_match, best_match)
+                else:
+                    # Create new global speaker
+                    new_id = f"SPEAKER_{len(global_speakers) + 1}"
+                    speaker_mapping[speaker] = new_id
+                    global_speakers.append(speaker)
+                
             # Create final harmonized list of speaker segments
             speakers = []
             for segment in all_speakers:
