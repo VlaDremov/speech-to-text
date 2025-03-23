@@ -7,3 +7,4 @@ numpy
 scipy
 audioread
 python-dotenv
+pydub==0.25.1
