@@ -81,11 +81,31 @@ class SimpleDiarization:
 
         # Extract embeddings for each segment
         embeddings = []
+        import torchaudio
+
         for seg in segments:
             try:
-                embedding = self.embedding_model.audio_path_to_embedding(
-                    audio_path, start=seg["start"], end=seg["end"]
+                # Load audio segment
+                waveform, sample_rate = torchaudio.load(
+                    audio_path,
+                    frame_offset=int(seg["start"] * 16000),
+                    num_frames=int((seg["end"] - seg["start"]) * 16000),
                 )
+
+                # Convert to mono if needed
+                if waveform.shape[0] > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+                # Resample if needed
+                if sample_rate != 16000:
+                    resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+                    waveform = resampler(waveform)
+
+                # Extract embedding using SpeechBrain's model
+                with torch.no_grad():
+                    embedding = self.embedding_model.encode_batch(waveform)
+                    embedding = embedding.squeeze().cpu().numpy()
+
                 embeddings.append(embedding)
             except Exception as e:
                 logging.warning(f"Failed to extract embedding: {e}")
@@ -102,28 +122,28 @@ class SimpleDiarization:
 
         # Perform clustering with our custom threshold
         embeddings_array = np.vstack(valid_embeddings)
-        
+
         # Calculate distance matrix
         distances = cdist(embeddings_array, embeddings_array)
-        
+
         # Use distance-based clustering with our threshold if num_speakers is None
         if self.num_speakers is None:
             # Apply linkage with average method
-            Z = linkage(distances, method='average')
-            
+            Z = linkage(distances, method="average")
+
             # Apply threshold to get clusters
             # Convert our threshold parameter: lower clustering_threshold means higher distance cutoff
             distance_cutoff = (1.0 - self.clustering_threshold) * distances.max()
-            clusters = fcluster(Z, t=distance_cutoff, criterion='distance')
-            
+            clusters = fcluster(Z, t=distance_cutoff, criterion="distance")
+
             # Adjust cluster IDs to be 0-indexed for consistency
             clusters = clusters - 1
         else:
             # Use scikit-learn's clustering with fixed number of clusters
             clustering = AgglomerativeClustering(
-                n_clusters=self.num_speakers, 
-                metric='precomputed', 
-                linkage='average'  # Use average linkage for consistency
+                n_clusters=self.num_speakers,
+                metric="precomputed",
+                linkage="average",  # Use average linkage for consistency
             )
             clusters = clustering.fit_predict(distances)
 
@@ -134,7 +154,7 @@ class SimpleDiarization:
         return valid_segments
 
     def merge_segments_with_overlap(
-        self, segments: List[Dict], tolerance: float = 0.3, min_duration: float = 0.3
+        self, segments: List[Dict], tolerance: float = 0.2, min_duration: float = 0.3
     ) -> List[Dict]:
         """
         Merge segments while detecting overlaps.
@@ -172,38 +192,57 @@ class SimpleDiarization:
                     last["end"] = overlap_start
                     seg["start"] = overlap_end
 
-                    merged.append(overlap_seg)
-                    # Check if the trimmed current segment still has enough
-                    # duration
-                    if seg["end"] - seg["start"] >= min_duration:
+                    # Only add the overlap segment if both original segments
+                    # still have sufficient duration
+                    if (last["end"] - last["start"]) >= min_duration / 2:
+                        merged.append(overlap_seg)
+                    else:
+                        # Restore last segment's end time if it would be too short
+                        last["end"] = overlap_end
+
+                    # Add the current segment if it has enough duration
+                    if (seg["end"] - seg["start"]) >= min_duration:
                         merged.append(seg)
                 else:
-                    # If the overlap is too short, merge if same speaker
+                    # If the overlap is too short
+                    # Be more conservative about merging - only merge if clearly the same speaker
                     if last["speaker"] == seg["speaker"]:
+                        # Merge only if they're the same speaker
                         last["end"] = max(last["end"], seg["end"])
                     else:
+                        # Otherwise, use the speaker with longer duration in the overlap region
+                        last_dur = last["end"] - last["start"]
+                        seg_dur = seg["end"] - seg["start"]
+
+                        if (
+                            seg_dur > last_dur * 1.5
+                        ):  # Significant difference in duration
+                            # Current segment is much longer, so it likely dominates
+                            seg["start"] = last["start"]  # Take over the last segment
+                            merged[-1] = seg  # Replace last segment
+                        elif last_dur > seg_dur * 1.5:
+                            # Last segment is much longer, extend it
+                            last["end"] = max(last["end"], seg["end"])
+                        else:
+                            # Similar durations, keep as separate segments
+                            # Slightly adjust boundaries to avoid tiny overlaps
+                            boundary = (last["end"] + seg["start"]) / 2
+                            last["end"] = boundary
+                            seg["start"] = boundary
+                            merged.append(seg)
+            else:
+                # Check if segments are very close but don't overlap
+                gap = seg["start"] - last["end"]
+                if gap < tolerance:
+                    # Only merge if same speaker, otherwise keep separate
+                    if last["speaker"] == seg["speaker"]:
+                        last["end"] = seg["end"]
+                    else:
                         merged.append(seg)
-            else:
-                merged.append(seg)
+                else:
+                    merged.append(seg)
 
-        # Initialize smoothed segments list with first segment
-        smoothed = [merged[0]]
-
-        # Iterate through remaining segments
-        for seg in merged[1:]:
-            last = smoothed[-1]
-            # Calculate gap between current and last segment
-            gap = seg["start"] - last["end"]
-
-            # If gap is small enough and speakers match,
-            # extend the last segment to include this one
-            if gap <= tolerance and last["speaker"] == seg["speaker"]:
-                last["end"] = seg["end"]
-            # Otherwise add as new segment
-            else:
-                smoothed.append(seg)
-
-        return smoothed
+        return merged
 
     def process(self, audio_path: str) -> List[Dict]:
         logging.info(f"Processing audio file: {audio_path}")
@@ -221,30 +260,46 @@ class SimpleDiarization:
                     # This is specific to pyannote/speaker-diarization-3.1
                     if hasattr(self.pipeline, "instantiate"):
                         # For newer versions of pyannote
-                        self.pipeline.instantiate({
-                            "clustering": {
-                                "method": "average",  # Valid methods: single, complete, average, weighted, centroid, median, ward
-                                "threshold": self.clustering_threshold,
+                        self.pipeline.instantiate(
+                            {
+                                "clustering": {
+                                    "method": "average",  # Valid methods: single, complete, average, weighted, centroid, median, ward
+                                    "threshold": self.clustering_threshold,
+                                }
                             }
-                        })
-                        diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
+                        )
+                        diarization = self.pipeline(
+                            processed_audio, num_speakers=self.num_speakers
+                        )
                     else:
                         # For older versions, modify the pipeline parameters directly
-                        if hasattr(self.pipeline, "clustering") and hasattr(self.pipeline.clustering, "threshold"):
+                        if hasattr(self.pipeline, "clustering") and hasattr(
+                            self.pipeline.clustering, "threshold"
+                        ):
                             original_threshold = self.pipeline.clustering.threshold
-                            self.pipeline.clustering.threshold = self.clustering_threshold
-                            diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
+                            self.pipeline.clustering.threshold = (
+                                self.clustering_threshold
+                            )
+                            diarization = self.pipeline(
+                                processed_audio, num_speakers=self.num_speakers
+                            )
                             # Restore original threshold
                             self.pipeline.clustering.threshold = original_threshold
                         else:
                             # If we can't directly set threshold, just run with default
-                            logging.warning("Could not set clustering threshold, using default")
-                            diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
+                            logging.warning(
+                                "Could not set clustering threshold, using default"
+                            )
+                            diarization = self.pipeline(
+                                processed_audio, num_speakers=self.num_speakers
+                            )
                 except Exception as e:
                     # Fall back to default parameters if customization fails
                     logging.warning(f"Error setting custom clustering parameters: {e}")
                     logging.warning("Falling back to default pipeline settings")
-                    diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
+                    diarization = self.pipeline(
+                        processed_audio, num_speakers=self.num_speakers
+                    )
 
             segments = [
                 {"start": turn.start, "end": turn.end, "speaker": f"SPEAKER_{speaker}"}
@@ -264,7 +319,9 @@ class SimpleDiarization:
                     if seg["start"] < speech.end and seg["end"] > speech.start:
                         filtered_segments.append(seg)
                         break
-            logging.info(f"{len(filtered_segments)} segments remain after VAD filtering.")
+            logging.info(
+                f"{len(filtered_segments)} segments remain after VAD filtering."
+            )
 
             # Refine speaker clusters using embeddings
             refined_segments = self.refine_speaker_clusters(
@@ -286,15 +343,18 @@ class SimpleDiarization:
             ]
             logging.info(f"{len(final_segments)} segments after duration filtering.")
 
-            logging.info(f"Processing completed in {time.time() - start_time:.2f} seconds.")
+            logging.info(
+                f"Processing completed in {time.time() - start_time:.2f} seconds."
+            )
             return final_segments
-            
+
         except Exception as e:
             logging.error(f"Error in diarization processing: {str(e)}")
             # Return minimal segments to avoid breaking the pipeline
             logging.warning("Returning minimal speaker segmentation as fallback")
             # Create at least one speaker segment for the whole audio
             import soundfile as sf
+
             info = sf.info(audio_path)
             duration = info.duration
             return [{"start": 0.0, "end": duration, "speaker": "SPEAKER_FALLBACK"}]

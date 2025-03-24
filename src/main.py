@@ -88,39 +88,72 @@ def merge_short_segments(segments, min_duration=0.1, max_gap=0.3):
     # Sort segments by start time
     segments = sorted(segments, key=lambda x: x["start"])
     merged = []
+
+    # First pass: handle very short segments
     current = segments[0].copy()
 
     for next_seg in segments[1:]:
         # If current segment is too short
         if (current["end"] - current["start"]) < min_duration:
-            # If same speaker or very close, merge them
+            # If same speaker, merge them
             if current["speaker"] == next_seg["speaker"]:
                 current["end"] = next_seg["end"]
             else:
-                # If different speakers, choose the longer one
-                if (
-                    next_seg["end"] - next_seg["start"]
-                    > current["end"] - current["start"]
+                # If different speakers with a very short segment,
+                # be more careful about merging
+
+                # Check if this is a transition between speakers
+                # If the next segment is similar length or longer,
+                # prefer keeping the speakers separate
+                if (next_seg["end"] - next_seg["start"]) >= (
+                    current["end"] - current["start"]
                 ):
-                    # Keep start time but use next segment's speaker and end time
-                    current["speaker"] = next_seg["speaker"]
-                    current["end"] = next_seg["end"]
-                # If current is longer, just extend it
+                    # Add current (even if short) and move to next
+                    merged.append(current)
+                    current = next_seg.copy()
                 else:
+                    # Current segment is longer, extend it
                     current["end"] = max(current["end"], next_seg["end"])
         else:
             # Check if gap between segments is small
             gap = next_seg["start"] - current["end"]
+
+            # Only merge if same speaker AND small gap
             if gap < max_gap and current["speaker"] == next_seg["speaker"]:
-                # Merge if same speaker and small gap
                 current["end"] = next_seg["end"]
             else:
                 # Add current to results and move to next
                 merged.append(current)
                 current = next_seg.copy()
 
+    # Add the last segment
     merged.append(current)
-    return merged
+
+    # Second pass: fix any remaining very short segments
+    final_segments = []
+
+    for seg in merged:
+        # Skip extremely short segments
+        if (seg["end"] - seg["start"]) < min_duration / 2:
+            continue
+
+        # For borderline short segments, look at surrounding segments in final result
+        if (seg["end"] - seg["start"]) < min_duration:
+            # If we have previous segments, check if we should merge
+            if final_segments:
+                last = final_segments[-1]
+                # Only merge if same speaker and close enough
+                if (
+                    last["speaker"] == seg["speaker"]
+                    and (seg["start"] - last["end"]) < max_gap
+                ):
+                    last["end"] = seg["end"]
+                    continue
+
+        # Add this segment
+        final_segments.append(seg)
+
+    return final_segments
 
 
 def calculate_speaker_confidence(segment, speaker_segments):
@@ -158,27 +191,35 @@ def calculate_speaker_confidence(segment, speaker_segments):
             ):
                 speaker = speaker_seg["speaker"]
                 speaker_counts[speaker] = speaker_counts.get(speaker, 0) + 1
-                
+
                 # Also consider duration of nearby segments
                 speaker_dur = speaker_seg["end"] - speaker_seg["start"]
-                speaker_durations[speaker] = speaker_durations.get(speaker, 0) + speaker_dur
+                speaker_durations[speaker] = (
+                    speaker_durations.get(speaker, 0) + speaker_dur
+                )
 
         # If we have nearby segments, boost confidence
         if speaker_counts:
             # Find speaker with most segments and longest duration
-            speakers_by_count = sorted(speaker_counts.items(), key=lambda x: x[1], reverse=True)
-            speakers_by_duration = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)
-            
+            speakers_by_count = sorted(
+                speaker_counts.items(), key=lambda x: x[1], reverse=True
+            )
+            speakers_by_duration = sorted(
+                speaker_durations.items(), key=lambda x: x[1], reverse=True
+            )
+
             # Combine both metrics
             combined_score = {}
             for speaker, count in speakers_by_count:
                 combined_score[speaker] = count / max(speaker_counts.values())
-                
+
             for speaker, duration in speakers_by_duration:
-                combined_score[speaker] = combined_score.get(speaker, 0) + duration / max(speaker_durations.values())
-            
+                combined_score[speaker] = combined_score.get(
+                    speaker, 0
+                ) + duration / max(speaker_durations.values())
+
             most_likely_speaker = max(combined_score.items(), key=lambda x: x[1])[0]
-            
+
             # If we already found an overlapping speaker, give it priority
             if best_speaker and best_speaker in speaker_counts:
                 # Adjust overlap ratio based on speaker context
@@ -223,16 +264,16 @@ def main():
     mode = "local"
     if mode == "local":
         input_file = os.path.join(input_dir, "audio_mom_240s.m4a")
-        output_filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        output_filename = f"transcript_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
         output_file = os.path.join(output_dir, output_filename)
         model_size = "medium"
     elif mode == "colab":
         # Google Colab paths
         input_file = (
-            "/content/drive/MyDrive/your_audio_file.m4a"  # Your audio file on Drive
+            "/content/drive/MyDrive/audio_mom_240s.m4a"  # Your audio file on Drive
         )
         output_dir = "/content/drive/MyDrive/"
-        output_filename = f"transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        output_filename = f"transcript_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
         output_file = os.path.join(output_dir, output_filename)
         model_size = "large-v3"  # Or "large-v3" if you have enough resources
 
@@ -257,24 +298,24 @@ def main():
     # - Lower values (0.3-0.4): More aggressive separation, more speakers detected
     # - Higher values (0.6-0.7): More conservative, may merge similar voices
     # Note: For PyAnnote, threshold is used with "average" linkage method
-    default_clustering_threshold = 0.45  # Balanced value for most recordings
+    default_clustering_threshold = 0.35  # Lower value for better speaker separation
 
     # Audio chunking parameters
     enable_chunking = True  # Set to False to disable chunking completely
     chunk_size_seconds = 30  # Reduced from 60 for better segmentation
-    chunk_overlap_seconds = 10  # Adjusted from 20
+    chunk_overlap_seconds = 15  # Increased from 10 for better continuity
     max_duration_for_single_chunk = 90  # Reduced from 120
 
     # Segment merging parameters
-    default_merge_duration = 0.2
-    default_merge_gap = 0.2
-    phone_merge_duration = 0.2
-    phone_merge_gap = 0.2
+    default_merge_duration = 0.15  # Reduced from 0.2
+    default_merge_gap = 0.15  # Reduced from 0.2
+    phone_merge_duration = 0.15  # Reduced from 0.2
+    phone_merge_gap = 0.15  # Reduced from 0.2
 
     # Speaker confidence thresholds
-    confidence_threshold_default = 0.1
-    confidence_threshold_noisy = 0.08
-    confidence_threshold_clean = 0.12
+    confidence_threshold_default = 0.08  # Reduced from 0.1
+    confidence_threshold_noisy = 0.06  # Reduced from 0.08
+    confidence_threshold_clean = 0.1  # Reduced from 0.12
 
     # =====================================
     # MAIN PROCESSING
@@ -438,52 +479,62 @@ def main():
             # Improved speaker mapping algorithm
             speaker_mapping = {}
             global_speakers = []
-            
+
             # Sort clusters by total duration (longer clusters first)
             sorted_clusters = sorted(
                 speaker_clusters.items(),
                 key=lambda x: sum(seg["end"] - seg["start"] for seg in x[1]),
-                reverse=True
+                reverse=True,
             )
-            
+
             for speaker, segments in sorted_clusters:
                 best_match = None
                 best_score = 0.15  # Minimum threshold to consider a match
-                
+
                 # Compare with existing global speakers
                 for global_speaker in global_speakers:
                     g_segments = speaker_clusters[global_speaker]
-                    
+
                     # Skip if speakers are from same chunks (they can't be the same person)
-                    if any(seg["chunk"] == g_seg["chunk"] for seg in segments for g_seg in g_segments):
+                    if any(
+                        seg["chunk"] == g_seg["chunk"]
+                        for seg in segments
+                        for g_seg in g_segments
+                    ):
                         continue
-                    
+
                     # Check segment overlaps with looser criteria
                     segment_overlaps = 0
                     for segment in segments:
                         for g_segment in g_segments:
                             # Consider nearby segments too
                             nearby_threshold = 1.0  # Consider segments within 1s
-                            overlap_condition = (segment["start"] - nearby_threshold <= g_segment["end"]) and (segment["end"] + nearby_threshold >= g_segment["start"])
+                            overlap_condition = (
+                                segment["start"] - nearby_threshold <= g_segment["end"]
+                            ) and (
+                                segment["end"] + nearby_threshold >= g_segment["start"]
+                            )
                             if overlap_condition:
                                 segment_overlaps += 1
                                 break
-                    
+
                     overlap_score = segment_overlaps / len(segments)
-                    
+
                     if overlap_score > best_score:
                         best_score = overlap_score
                         best_match = global_speaker
-                
+
                 if best_match:
                     # Map to existing global speaker
-                    speaker_mapping[speaker] = speaker_mapping.get(best_match, best_match)
+                    speaker_mapping[speaker] = speaker_mapping.get(
+                        best_match, best_match
+                    )
                 else:
                     # Create new global speaker
                     new_id = f"SPEAKER_{len(global_speakers) + 1}"
                     speaker_mapping[speaker] = new_id
                     global_speakers.append(speaker)
-                
+
             # Create final harmonized list of speaker segments
             speakers = []
             for segment in all_speakers:
