@@ -263,14 +263,14 @@ def main():
     # Input/output file configuration
     mode = "local"
     if mode == "local":
-        input_file = os.path.join(input_dir, "audio_mom_240s.m4a")
+        input_file = os.path.join(input_dir, "vlad-d-test.m4a")
         output_filename = f"transcript_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
         output_file = os.path.join(output_dir, output_filename)
         model_size = "medium"
     elif mode == "colab":
         # Google Colab paths
         input_file = (
-            "/content/drive/MyDrive/audio_mom_240s.m4a"  # Your audio file on Drive
+            "/content/drive/MyDrive/vlad-d-test.m4a"  # Your audio file on Drive
         )
         output_dir = "/content/drive/MyDrive/"
         output_filename = f"transcript_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt"
@@ -302,9 +302,19 @@ def main():
 
     # Audio chunking parameters
     enable_chunking = True  # Set to False to disable chunking completely
-    chunk_size_seconds = 30  # Reduced from 60 for better segmentation
-    chunk_overlap_seconds = 15  # Increased from 10 for better continuity
+    chunk_size_seconds = 60  # Increased from 30 for better speaker context
+    chunk_overlap_seconds = 20  # Optimized overlap for longer files
     max_duration_for_single_chunk = 90  # Reduced from 120
+    
+    # For very long files (>10 min), use hierarchical chunking
+    enable_hierarchical_chunking = True
+    # Process in larger segments first, then refine
+    super_chunk_size = 300  # 5 minute super-chunks for initial processing
+    super_chunk_overlap = 60  # 1 minute overlap between super-chunks
+    
+    # Speaker embedding parameters
+    min_speech_duration_for_embedding = 3.0  # Minimum ideal speech duration for reliable embedding
+    max_speakers_per_recording = 8  # Maximum number of unique speakers to expect in very long recordings
 
     # Segment merging parameters
     default_merge_duration = 0.15  # Reduced from 0.2
@@ -421,141 +431,348 @@ def main():
             )
 
             # STEP 11.1: Split audio into overlapping chunks
-            chunk_size_samples = int(chunk_size_seconds * sr)
-            chunk_overlap_samples = int(chunk_overlap_seconds * sr)
-
-            # Create a list to store chunk files and results
-            chunk_files = []
-            all_speakers = []
-
-            # Calculate number of chunks
-            num_chunks = int(
-                np.ceil(len(audio) / (chunk_size_samples - chunk_overlap_samples))
-            )
-            logging.info(
-                f"Splitting audio into {num_chunks} chunks with {chunk_overlap_seconds}s overlap"
-            )
-
-            # Process each chunk
-            for i in range(num_chunks):
-                start_sample = max(0, i * (chunk_size_samples - chunk_overlap_samples))
-                end_sample = min(len(audio), start_sample + chunk_size_samples)
-
-                chunk_audio = audio[start_sample:end_sample]
-                chunk_filename = f"{base}_chunk_{i+1}.wav"
-                chunk_path = os.path.join(temp_dir, chunk_filename)
-                chunk_files.append(chunk_path)
-
-                # Save chunk to file
-                sf.write(chunk_path, chunk_audio, sr)
-                logging.info(f"Saved chunk {i+1}/{num_chunks} to {chunk_path}")
-
-                # Process this chunk
-                logging.info(f"Processing chunk {i+1}/{num_chunks}")
-                chunk_speakers = diarizer.process(chunk_path)
-
-                # Adjust timestamps to account for the chunk position in the original audio
-                start_time = start_sample / sr
-                for segment in chunk_speakers:
-                    segment["start"] += start_time
-                    segment["end"] += start_time
-                    # Add chunk info for debugging/analysis
-                    segment["chunk"] = i + 1
-
-                all_speakers.extend(chunk_speakers)
-                logging.info(
-                    f"Chunk {i+1} produced {len(chunk_speakers)} speaker segments"
+            if enable_hierarchical_chunking and duration_seconds > 600:  # > 10 minutes
+                logging.info("Using hierarchical chunking for long recording")
+                # First level: Super chunks
+                super_chunk_size_samples = int(super_chunk_size * sr)
+                super_chunk_overlap_samples = int(super_chunk_overlap * sr)
+                
+                # Calculate number of super chunks
+                num_super_chunks = int(
+                    np.ceil(len(audio) / (super_chunk_size_samples - super_chunk_overlap_samples))
                 )
-
-            # STEP 11.2: Harmonize speaker labels across chunks
-            # Build a mapping of speaker embeddings to find consistent labels
-            speaker_clusters = defaultdict(list)
-
-            # First, group segments by original speaker
-            for segment in all_speakers:
-                original_speaker = segment["speaker"]
-                speaker_clusters[original_speaker].append(segment)
-
-            # Improved speaker mapping algorithm
-            speaker_mapping = {}
-            global_speakers = []
-
-            # Sort clusters by total duration (longer clusters first)
-            sorted_clusters = sorted(
-                speaker_clusters.items(),
-                key=lambda x: sum(seg["end"] - seg["start"] for seg in x[1]),
-                reverse=True,
-            )
-
-            for speaker, segments in sorted_clusters:
-                best_match = None
-                best_score = 0.15  # Minimum threshold to consider a match
-
-                # Compare with existing global speakers
-                for global_speaker in global_speakers:
-                    g_segments = speaker_clusters[global_speaker]
-
-                    # Skip if speakers are from same chunks (they can't be the same person)
-                    if any(
-                        seg["chunk"] == g_seg["chunk"]
-                        for seg in segments
-                        for g_seg in g_segments
-                    ):
-                        continue
-
-                    # Check segment overlaps with looser criteria
-                    segment_overlaps = 0
-                    for segment in segments:
-                        for g_segment in g_segments:
-                            # Consider nearby segments too
-                            nearby_threshold = 1.0  # Consider segments within 1s
-                            overlap_condition = (
-                                segment["start"] - nearby_threshold <= g_segment["end"]
-                            ) and (
-                                segment["end"] + nearby_threshold >= g_segment["start"]
-                            )
-                            if overlap_condition:
-                                segment_overlaps += 1
-                                break
-
-                    overlap_score = segment_overlaps / len(segments)
-
-                    if overlap_score > best_score:
-                        best_score = overlap_score
-                        best_match = global_speaker
-
-                if best_match:
-                    # Map to existing global speaker
-                    speaker_mapping[speaker] = speaker_mapping.get(
-                        best_match, best_match
+                logging.info(f"Splitting audio into {num_super_chunks} super chunks with {super_chunk_overlap}s overlap")
+                
+                all_speakers = []
+                global_speaker_dict = {}  # Global speaker identity tracker
+                next_speaker_id = 1  # For consistent global speaker IDs
+                
+                # Process each super chunk
+                for i in range(num_super_chunks):
+                    super_start_sample = max(0, i * (super_chunk_size_samples - super_chunk_overlap_samples))
+                    super_end_sample = min(len(audio), super_start_sample + super_chunk_size_samples)
+                    
+                    super_chunk_audio = audio[super_start_sample:super_end_sample]
+                    super_chunk_filename = f"{base}_superchunk_{i+1}.wav"
+                    super_chunk_path = os.path.join(temp_dir, super_chunk_filename)
+                    
+                    # Save super chunk to file
+                    sf.write(super_chunk_path, super_chunk_audio, sr)
+                    logging.info(f"Processing super chunk {i+1}/{num_super_chunks}")
+                    
+                    # Now process this super chunk with standard chunking
+                    chunk_size_samples = int(chunk_size_seconds * sr)
+                    chunk_overlap_samples = int(chunk_overlap_seconds * sr)
+                    
+                    # Get number of chunks needed for this super chunk
+                    num_chunks = int(
+                        np.ceil(len(super_chunk_audio) / (chunk_size_samples - chunk_overlap_samples))
                     )
-                else:
-                    # Create new global speaker
-                    new_id = f"SPEAKER_{len(global_speakers) + 1}"
-                    speaker_mapping[speaker] = new_id
-                    global_speakers.append(speaker)
+                    
+                    chunk_files = []
+                    super_chunk_speakers = []
+                    
+                    # Process chunks within this super chunk
+                    for j in range(num_chunks):
+                        start_sample = max(0, j * (chunk_size_samples - chunk_overlap_samples))
+                        end_sample = min(len(super_chunk_audio), start_sample + chunk_size_samples)
+                        
+                        chunk_audio = super_chunk_audio[start_sample:end_sample]
+                        chunk_filename = f"{base}_superchunk_{i+1}_chunk_{j+1}.wav"
+                        chunk_path = os.path.join(temp_dir, chunk_filename)
+                        chunk_files.append(chunk_path)
+                        
+                        # Save chunk to file
+                        sf.write(chunk_path, chunk_audio, sr)
+                        
+                        # Process this chunk
+                        chunk_speakers = diarizer.process(chunk_path)
+                        
+                        # Adjust timestamps to account for chunk positions
+                        chunk_start_time = super_start_sample / sr + start_sample / sr
+                        for segment in chunk_speakers:
+                            segment["start"] += chunk_start_time
+                            segment["end"] += chunk_start_time
+                            segment["super_chunk"] = i + 1
+                            segment["chunk"] = j + 1
+                        
+                        super_chunk_speakers.extend(chunk_speakers)
+                    
+                    # Clean up chunk files
+                    for chunk_file in chunk_files:
+                        if os.path.exists(chunk_file):
+                            os.remove(chunk_file)
+                    
+                    # Harmonize speaker labels within this super chunk first
+                    speaker_clusters = defaultdict(list)
+                    for segment in super_chunk_speakers:
+                        speaker_clusters[segment["speaker"]].append(segment)
+                    
+                    # Merge speakers within this super chunk
+                    local_speaker_mapping = {}
+                    local_speakers = []
+                    
+                    # Sort by total duration (longer first)
+                    sorted_clusters = sorted(
+                        speaker_clusters.items(),
+                        key=lambda x: sum(seg["end"] - seg["start"] for seg in x[1]),
+                        reverse=True
+                    )
+                    
+                    for speaker, segments in sorted_clusters:
+                        local_id = f"LOCAL_SPEAKER_{len(local_speakers) + 1}"
+                        local_speaker_mapping[speaker] = local_id
+                        local_speakers.append(speaker)
+                    
+                    # Apply local mapping
+                    for segment in super_chunk_speakers:
+                        segment["original_speaker"] = segment["speaker"]
+                        segment["speaker"] = local_speaker_mapping[segment["speaker"]]
+                    
+                    # Now map these local speakers to global speakers using embeddings
+                    # Extract a representative embedding for each local speaker
+                    if all_speakers and i > 0:  # Not the first super chunk
+                        # Map to existing global speakers
+                        for local_speaker in local_speakers:
+                            local_segments = [seg for seg in super_chunk_speakers 
+                                            if seg["original_speaker"] == local_speaker]
+                            
+                            # Find best matching global speaker
+                            best_match = None
+                            best_score = 0.5  # Higher threshold for super chunk matching
+                            
+                            for global_speaker, global_segments in global_speaker_dict.items():
+                                # Compare temporal patterns and durations
+                                match_score = 0
+                                
+                                # If global speaker appears in adjacent super chunk, higher score
+                                if any(seg["super_chunk"] == i for seg in global_segments):
+                                    match_score += 0.3
+                                
+                                # Compare average segment durations
+                                local_avg_dur = sum(seg["end"] - seg["start"] for seg in local_segments) / len(local_segments)
+                                global_avg_dur = sum(seg["end"] - seg["start"] for seg in global_segments) / len(global_segments)
+                                dur_similarity = 1 - min(abs(local_avg_dur - global_avg_dur) / max(local_avg_dur, global_avg_dur), 1)
+                                match_score += dur_similarity * 0.2
+                                
+                                if match_score > best_score:
+                                    best_score = match_score
+                                    best_match = global_speaker
+                            
+                            # Assign global speaker
+                            if best_match:
+                                # Map to existing global speaker
+                                for segment in local_segments:
+                                    segment["speaker"] = best_match
+                                    global_speaker_dict[best_match].append(segment)
+                            else:
+                                # Create new global speaker
+                                new_global_id = f"SPEAKER_{next_speaker_id}"
+                                next_speaker_id += 1
+                                for segment in local_segments:
+                                    segment["speaker"] = new_global_id
+                                global_speaker_dict[new_global_id] = local_segments
+                    else:
+                        # First super chunk, all speakers are new global speakers
+                        for local_speaker in local_speakers:
+                            local_segments = [seg for seg in super_chunk_speakers 
+                                             if seg["original_speaker"] == local_speaker]
+                            
+                            new_global_id = f"SPEAKER_{next_speaker_id}"
+                            next_speaker_id += 1
+                            
+                            for segment in local_segments:
+                                segment["speaker"] = new_global_id
+                            
+                            global_speaker_dict[new_global_id] = local_segments
+                    
+                    # Add to all speakers
+                    all_speakers.extend(super_chunk_speakers)
+                    
+                    # Clean up super chunk file
+                    if os.path.exists(super_chunk_path):
+                        os.remove(super_chunk_path)
+                
+                # Apply global speaker limit if needed
+                if len(global_speaker_dict) > max_speakers_per_recording:
+                    logging.warning(f"Detected {len(global_speaker_dict)} speakers, limiting to {max_speakers_per_recording}")
+                    # Sort speakers by total duration
+                    speaker_durations = {}
+                    for speaker, segments in global_speaker_dict.items():
+                        total_duration = sum(seg["end"] - seg["start"] for seg in segments)
+                        speaker_durations[speaker] = total_duration
+                    
+                    # Keep only the top N speakers by duration
+                    top_speakers = sorted(speaker_durations.items(), key=lambda x: x[1], reverse=True)[:max_speakers_per_recording]
+                    top_speaker_ids = [speaker for speaker, _ in top_speakers]
+                    
+                    # Map minor speakers to the closest major speaker
+                    for speaker in global_speaker_dict:
+                        if speaker not in top_speaker_ids:
+                            segments = global_speaker_dict[speaker]
+                            # Find closest top speaker in time
+                            best_match = top_speaker_ids[0]
+                            best_overlap = 0
+                            
+                            for top_speaker in top_speaker_ids:
+                                top_segments = global_speaker_dict[top_speaker]
+                                overlap_count = 0
+                                
+                                for seg in segments:
+                                    for top_seg in top_segments:
+                                        # Check for temporal proximity
+                                        if (abs(seg["start"] - top_seg["end"]) < 5.0 or 
+                                           abs(top_seg["start"] - seg["end"]) < 5.0):
+                                            overlap_count += 1
+                                
+                                if overlap_count > best_overlap:
+                                    best_overlap = overlap_count
+                                    best_match = top_speaker
+                            
+                            # Reassign segments
+                            for seg in segments:
+                                seg["speaker"] = best_match
+                
+                # Sort by start time
+                speakers = sorted(all_speakers, key=lambda x: x["start"])
+                
+            else:
+                # Original chunking for shorter files
+                chunk_size_samples = int(chunk_size_seconds * sr)
+                chunk_overlap_samples = int(chunk_overlap_seconds * sr)
 
-            # Create final harmonized list of speaker segments
-            speakers = []
-            for segment in all_speakers:
-                fixed_segment = segment.copy()
-                original_speaker = segment["speaker"]
-                fixed_segment["speaker"] = speaker_mapping.get(
-                    original_speaker, original_speaker
+                # Create a list to store chunk files and results
+                chunk_files = []
+                all_speakers = []
+
+                # Calculate number of chunks
+                num_chunks = int(
+                    np.ceil(len(audio) / (chunk_size_samples - chunk_overlap_samples))
                 )
-                speakers.append(fixed_segment)
+                logging.info(
+                    f"Splitting audio into {num_chunks} chunks with {chunk_overlap_seconds}s overlap"
+                )
 
-            # Sort segments by start time
-            speakers.sort(key=lambda x: x["start"])
+                # Process each chunk
+                for i in range(num_chunks):
+                    start_sample = max(0, i * (chunk_size_samples - chunk_overlap_samples))
+                    end_sample = min(len(audio), start_sample + chunk_size_samples)
 
-            # Clean up chunk files
-            for chunk_file in chunk_files:
-                if os.path.exists(chunk_file):
-                    os.remove(chunk_file)
+                    chunk_audio = audio[start_sample:end_sample]
+                    chunk_filename = f"{base}_chunk_{i+1}.wav"
+                    chunk_path = os.path.join(temp_dir, chunk_filename)
+                    chunk_files.append(chunk_path)
 
-            logging.info(
-                f"Completed chunked processing with {len(speakers)} total segments"
-            )
+                    # Save chunk to file
+                    sf.write(chunk_path, chunk_audio, sr)
+                    logging.info(f"Saved chunk {i+1}/{num_chunks} to {chunk_path}")
+
+                    # Process this chunk
+                    logging.info(f"Processing chunk {i+1}/{num_chunks}")
+                    chunk_speakers = diarizer.process(chunk_path)
+
+                    # Adjust timestamps to account for the chunk position in the original audio
+                    start_time = start_sample / sr
+                    for segment in chunk_speakers:
+                        segment["start"] += start_time
+                        segment["end"] += start_time
+                        # Add chunk info for debugging/analysis
+                        segment["chunk"] = i + 1
+
+                    all_speakers.extend(chunk_speakers)
+                    logging.info(
+                        f"Chunk {i+1} produced {len(chunk_speakers)} speaker segments"
+                    )
+
+                # STEP 11.2: Harmonize speaker labels across chunks
+                # Build a mapping of speaker embeddings to find consistent labels
+                speaker_clusters = defaultdict(list)
+
+                # First, group segments by original speaker
+                for segment in all_speakers:
+                    original_speaker = segment["speaker"]
+                    speaker_clusters[original_speaker].append(segment)
+
+                # Improved speaker mapping algorithm
+                speaker_mapping = {}
+                global_speakers = []
+
+                # Sort clusters by total duration (longer clusters first)
+                sorted_clusters = sorted(
+                    speaker_clusters.items(),
+                    key=lambda x: sum(seg["end"] - seg["start"] for seg in x[1]),
+                    reverse=True,
+                )
+
+                for speaker, segments in sorted_clusters:
+                    best_match = None
+                    best_score = 0.15  # Minimum threshold to consider a match
+
+                    # Compare with existing global speakers
+                    for global_speaker in global_speakers:
+                        g_segments = speaker_clusters[global_speaker]
+
+                        # Skip if speakers are from same chunks (they can't be the same person)
+                        if any(
+                            seg["chunk"] == g_seg["chunk"]
+                            for seg in segments
+                            for g_seg in g_segments
+                        ):
+                            continue
+
+                        # Check segment overlaps with looser criteria
+                        segment_overlaps = 0
+                        for segment in segments:
+                            for g_segment in g_segments:
+                                # Consider nearby segments too
+                                nearby_threshold = 1.0  # Consider segments within 1s
+                                overlap_condition = (
+                                    segment["start"] - nearby_threshold <= g_segment["end"]
+                                ) and (
+                                    segment["end"] + nearby_threshold >= g_segment["start"]
+                                )
+                                if overlap_condition:
+                                    segment_overlaps += 1
+                                    break
+
+                        overlap_score = segment_overlaps / len(segments)
+
+                        if overlap_score > best_score:
+                            best_score = overlap_score
+                            best_match = global_speaker
+
+                    if best_match:
+                        # Map to existing global speaker
+                        speaker_mapping[speaker] = speaker_mapping.get(
+                            best_match, best_match
+                        )
+                    else:
+                        # Create new global speaker
+                        new_id = f"SPEAKER_{len(global_speakers) + 1}"
+                        speaker_mapping[speaker] = new_id
+                        global_speakers.append(speaker)
+
+                # Create final harmonized list of speaker segments
+                speakers = []
+                for segment in all_speakers:
+                    fixed_segment = segment.copy()
+                    original_speaker = segment["speaker"]
+                    fixed_segment["speaker"] = speaker_mapping.get(
+                        original_speaker, original_speaker
+                    )
+                    speakers.append(fixed_segment)
+
+                # Sort segments by start time
+                speakers.sort(key=lambda x: x["start"])
+
+                # Clean up chunk files
+                for chunk_file in chunk_files:
+                    if os.path.exists(chunk_file):
+                        os.remove(chunk_file)
+
+                logging.info(
+                    f"Completed chunked processing with {len(speakers)} total segments"
+                )
         else:
             # Process the entire file as one chunk
             logging.info("Processing entire audio file as a single unit")

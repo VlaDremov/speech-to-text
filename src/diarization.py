@@ -8,6 +8,7 @@ from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbed
 from scipy.spatial.distance import cdist
 from sklearn.cluster import AgglomerativeClustering
 from scipy.cluster.hierarchy import fcluster, linkage
+from collections import defaultdict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +34,7 @@ class SimpleDiarization:
         self.num_speakers = num_speakers
         self.min_speaker_duration = min_speaker_duration
         self.clustering_threshold = clustering_threshold
+        self.long_recording = False  # Will be set based on audio duration
 
         logging.info(f"Loading VAD pipeline on {device}")
         self.vad_pipeline = Pipeline.from_pretrained(
@@ -51,6 +53,21 @@ class SimpleDiarization:
         except Exception as e:
             logging.warning(f"Failed to load speaker embedding model: {e}")
             logging.warning("Continuing without speaker embedding refinement")
+
+    def set_long_recording_mode(self, duration: float) -> None:
+        """Set special parameters for handling long recordings"""
+        if duration > 600:  # 10 minutes
+            self.long_recording = True
+            # Adjust parameters for long recordings
+            logging.info("Adjusting diarization parameters for long recording")
+            # Use a more stringent clustering threshold for longer files
+            if duration > 3600:  # 1 hour
+                self.clustering_threshold = max(0.3, self.clustering_threshold - 0.1)
+                logging.info(f"Using reduced clustering threshold: {self.clustering_threshold}")
+            # In long recordings, we need longer minimum duration to avoid fragmentation
+            self.min_speaker_duration = max(0.3, self.min_speaker_duration)
+        else:
+            self.long_recording = False
 
     def preprocess_audio(self, audio_path: str) -> str:
         """
@@ -248,6 +265,15 @@ class SimpleDiarization:
         logging.info(f"Processing audio file: {audio_path}")
         start_time = time.time()
 
+        # Check audio duration and adjust parameters if needed
+        try:
+            import soundfile as sf
+            info = sf.info(audio_path)
+            duration = info.duration
+            self.set_long_recording_mode(duration)
+        except Exception as e:
+            logging.warning(f"Could not determine audio duration: {e}")
+
         # Preprocess audio
         processed_audio = self.preprocess_audio(audio_path)
 
@@ -260,52 +286,76 @@ class SimpleDiarization:
                     # This is specific to pyannote/speaker-diarization-3.1
                     if hasattr(self.pipeline, "instantiate"):
                         # For newer versions of pyannote
-                        self.pipeline.instantiate(
-                            {
-                                "clustering": {
-                                    "method": "average",  # Valid methods: single, complete, average, weighted, centroid, median, ward
-                                    "threshold": self.clustering_threshold,
-                                }
+                        clustering_method = "average"
+                        if self.long_recording:
+                            # Adjust method for long recordings
+                            # Ward is more robust for longer files
+                            clustering_method = "ward"
+                        
+                        self.pipeline.instantiate({
+                            "clustering": {
+                                "method": clustering_method,
+                                "threshold": self.clustering_threshold,
+                            },
+                            "segmentation": {
+                                # Increase min_duration_off for long recordings to reduce fragmentation
+                                "min_duration_off": 0.5 if self.long_recording else 0.3
                             }
-                        )
-                        diarization = self.pipeline(
-                            processed_audio, num_speakers=self.num_speakers
-                        )
+                        })
+                        diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
                     else:
                         # For older versions, modify the pipeline parameters directly
-                        if hasattr(self.pipeline, "clustering") and hasattr(
-                            self.pipeline.clustering, "threshold"
-                        ):
+                        if hasattr(self.pipeline, "clustering") and hasattr(self.pipeline.clustering, "threshold"):
                             original_threshold = self.pipeline.clustering.threshold
-                            self.pipeline.clustering.threshold = (
-                                self.clustering_threshold
-                            )
-                            diarization = self.pipeline(
-                                processed_audio, num_speakers=self.num_speakers
-                            )
+                            self.pipeline.clustering.threshold = self.clustering_threshold
+                            diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
                             # Restore original threshold
                             self.pipeline.clustering.threshold = original_threshold
                         else:
                             # If we can't directly set threshold, just run with default
-                            logging.warning(
-                                "Could not set clustering threshold, using default"
-                            )
-                            diarization = self.pipeline(
-                                processed_audio, num_speakers=self.num_speakers
-                            )
+                            logging.warning("Could not set clustering threshold, using default")
+                            diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
                 except Exception as e:
                     # Fall back to default parameters if customization fails
                     logging.warning(f"Error setting custom clustering parameters: {e}")
                     logging.warning("Falling back to default pipeline settings")
-                    diarization = self.pipeline(
-                        processed_audio, num_speakers=self.num_speakers
-                    )
+                    diarization = self.pipeline(processed_audio, num_speakers=self.num_speakers)
 
             segments = [
                 {"start": turn.start, "end": turn.end, "speaker": f"SPEAKER_{speaker}"}
                 for turn, _, speaker in diarization.itertracks(yield_label=True)
             ]
             logging.info(f"Found {len(segments)} raw diarization segments.")
+
+            # For long recordings, apply additional filtering to remove spurious short segments
+            if self.long_recording and len(segments) > 100:
+                logging.info("Long recording with many segments, applying additional filtering")
+                
+                # Calculate speaker statistics
+                speaker_stats = defaultdict(lambda: {"count": 0, "total_duration": 0})
+                for seg in segments:
+                    speaker = seg["speaker"]
+                    duration = seg["end"] - seg["start"]
+                    speaker_stats[speaker]["count"] += 1
+                    speaker_stats[speaker]["total_duration"] += duration
+                
+                # Identify major vs. minor speakers
+                major_speakers = []
+                for speaker, stats in speaker_stats.items():
+                    if stats["count"] >= 5 and stats["total_duration"] >= 5.0:
+                        major_speakers.append(speaker)
+                
+                if len(major_speakers) >= 2:
+                    # We have identified major speakers, so filter out isolated segments from minor speakers
+                    filtered_by_speaker = []
+                    for seg in segments:
+                        if seg["speaker"] in major_speakers or (seg["end"] - seg["start"]) > 2.0:
+                            filtered_by_speaker.append(seg)
+                    
+                    # Only apply this filter if we're not losing too many segments
+                    if len(filtered_by_speaker) > len(segments) * 0.7:
+                        segments = filtered_by_speaker
+                        logging.info(f"Filtered to {len(segments)} segments from major speakers")
 
             # Run VAD to extract speech regions
             logging.info("Running voice activity detection (VAD)...")
